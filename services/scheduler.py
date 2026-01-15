@@ -1,0 +1,375 @@
+import logging
+from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+from database import async_session, User, Subscription, Config, Server, BotSettings
+from services.wireguard import WireGuardService
+from services.wireguard_multi import WireGuardMultiService
+from services.monitoring import MonitoringService
+from config import ADMIN_ID
+
+logger = logging.getLogger(__name__)
+
+
+async def get_setting(key: str, default: str = None) -> str:
+    """Получить значение настройки из БД"""
+    async with async_session() as session:
+        stmt = select(BotSettings).where(BotSettings.key == key)
+        result = await session.execute(stmt)
+        setting = result.scalar_one_or_none()
+        return setting.value if setting else default
+
+
+async def set_setting(key: str, value: str):
+    """Установить значение настройки в БД"""
+    async with async_session() as session:
+        stmt = select(BotSettings).where(BotSettings.key == key)
+        result = await session.execute(stmt)
+        setting = result.scalar_one_or_none()
+        if setting:
+            setting.value = value
+        else:
+            setting = BotSettings(key=key, value=value)
+            session.add(setting)
+        await session.commit()
+
+
+class SchedulerService:
+    def __init__(self, bot):
+        self.bot = bot
+        self.scheduler = AsyncIOScheduler()
+    
+    def start(self):
+        self.scheduler.add_job(
+            self.check_expiring_subscriptions,
+            IntervalTrigger(hours=1),
+            id="check_expiring",
+            replace_existing=True
+        )
+        
+        self.scheduler.add_job(
+            self.disable_expired_configs,
+            IntervalTrigger(hours=1),
+            id="disable_expired",
+            replace_existing=True
+        )
+        
+        self.scheduler.add_job(
+            self.check_suspicious_activity,
+            IntervalTrigger(hours=6),
+            id="check_suspicious",
+            replace_existing=True
+        )
+        
+        self.scheduler.add_job(
+            self.update_traffic_stats,
+            IntervalTrigger(minutes=5),
+            id="update_traffic",
+            replace_existing=True
+        )
+        
+        self.scheduler.start()
+        logger.info("Планировщик запущен")
+    
+    def stop(self):
+        self.scheduler.shutdown()
+        logger.info("Планировщик остановлен")
+    
+    async def check_expiring_subscriptions(self):
+        logger.info("Проверка истекающих подписок...")
+        
+        async with async_session() as session:
+            three_days_later = datetime.utcnow() + timedelta(days=3)
+            
+            stmt = select(Subscription).where(
+                Subscription.expires_at.isnot(None),
+                Subscription.expires_at <= three_days_later,
+                Subscription.expires_at > datetime.utcnow(),
+                Subscription.notified_3_days == False
+            ).options(selectinload(Subscription.user))
+            
+            result = await session.execute(stmt)
+            subscriptions = result.scalars().all()
+            
+            for sub in subscriptions:
+                try:
+                    user = sub.user
+                    
+                    # Проверяем, есть ли у пользователя другая активная подписка (бессрочная или с более поздней датой)
+                    active_sub_stmt = select(Subscription).where(
+                        Subscription.user_id == user.id,
+                        Subscription.id != sub.id,
+                        (Subscription.expires_at.is_(None) | (Subscription.expires_at > sub.expires_at))
+                    )
+                    active_result = await session.execute(active_sub_stmt)
+                    has_better_sub = active_result.scalar() is not None
+                    
+                    if has_better_sub:
+                        # У пользователя есть бессрочная или более длительная подписка — не уведомляем
+                        sub.notified_3_days = True
+                        await session.commit()
+                        logger.info(f"Пропускаем уведомление для {user.telegram_id} — есть активная подписка")
+                        continue
+                    
+                    days_left = (sub.expires_at - datetime.utcnow()).days
+                    
+                    await self.bot.send_message(
+                        user.telegram_id,
+                        f"⚠️ *Внимание!*\n\n"
+                        f"Ваша подписка истекает через {days_left} дн.\n"
+                        f"Дата окончания: {sub.expires_at.strftime('%d.%m.%Y')}\n\n"
+                        f"Продлите подписку, чтобы не потерять доступ к VPN.",
+                        parse_mode="Markdown"
+                    )
+                    
+                    sub.notified_3_days = True
+                    await session.commit()
+                    
+                    logger.info(f"Уведомление отправлено пользователю {user.telegram_id}")
+                    
+                except (TelegramBadRequest, TelegramForbiddenError) as e:
+                    error_msg = str(e)
+                    if "chat not found" in error_msg.lower() or "bot was blocked" in error_msg.lower() or "user is deactivated" in error_msg.lower():
+                        logger.warning(f"Пользователь недоступен user_id={user.telegram_id} (@{user.username}): {error_msg}")
+                        await self._handle_inactive_user(user)
+                    else:
+                        logger.error(f"Ошибка отправки уведомления user_id={user.telegram_id} (@{user.username}): {error_msg}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления user_id={user.telegram_id}: {e}")
+    
+    async def _handle_inactive_user(self, user):
+        """Обработка неактивного пользователя (чат не найден / бот заблокирован)"""
+        async with async_session() as session:
+            stmt = select(User).where(User.id == user.id)
+            result = await session.execute(stmt)
+            db_user = result.scalar_one_or_none()
+            if not db_user:
+                return
+            
+            db_user.failed_notifications += 1
+            await session.commit()
+            
+            user_info = f"@{db_user.username}" if db_user.username else db_user.full_name
+            
+            if db_user.failed_notifications >= 3:
+                auto_delete = await get_setting("auto_delete_inactive", "false")
+                
+                if auto_delete == "true":
+                    # Автодеактивация включена
+                    await self._deactivate_user(db_user.id)
+                else:
+                    # Уведомляем админа
+                    try:
+                        from keyboards.admin_kb import get_inactive_user_kb
+                        await self.bot.send_message(
+                            ADMIN_ID,
+                            f"⚠️ Неактивный пользователь\n\n"
+                            f"👤 {user_info}\n"
+                            f"🆔 ID: {db_user.telegram_id}\n"
+                            f"❌ Неудачных уведомлений: {db_user.failed_notifications}\n\n"
+                            f"Пользователь заблокировал бота или удалил аккаунт.",
+                            reply_markup=get_inactive_user_kb(db_user.id),
+                            parse_mode=None
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка уведомления админа о неактивном пользователе: {e}")
+    
+    async def _deactivate_user(self, user_id: int):
+        """Деактивация пользователя (soft-delete): удаляем конфиги, помечаем is_blocked=True"""
+        async with async_session() as session:
+            stmt = select(User).where(User.id == user_id).options(selectinload(User.configs))
+            result = await session.execute(stmt)
+            user = result.scalar_one_or_none()
+            if not user:
+                return
+            
+            user_info = f"@{user.username}" if user.username else user.full_name
+            
+            # Удаляем конфиги с серверов (освобождаем ресурсы)
+            for config in user.configs:
+                try:
+                    if config.server_id:
+                        server = await WireGuardMultiService.get_server_by_id(session, config.server_id)
+                        if server:
+                            await WireGuardMultiService.delete_config(config.name, server, config.public_key)
+                    else:
+                        await WireGuardService.delete_config(config.name)
+                except Exception as e:
+                    logger.error(f"Ошибка удаления конфига {config.name}: {e}")
+            
+            # Удаляем конфиги из БД
+            for config in user.configs:
+                await session.delete(config)
+            
+            # Удаляем подписки
+            from database.models import Subscription
+            sub_stmt = select(Subscription).where(Subscription.user_id == user.id)
+            sub_result = await session.execute(sub_stmt)
+            for sub in sub_result.scalars().all():
+                await session.delete(sub)
+            
+            # Помечаем пользователя как неактивного (soft-delete)
+            user.is_blocked = True
+            await session.commit()
+            
+            logger.info(f"Пользователь {user_info} (ID: {user.telegram_id}) деактивирован (is_blocked=True)")
+    
+    async def disable_expired_configs(self):
+        logger.info("Проверка истекших подписок...")
+        
+        async with async_session() as session:
+            stmt = select(Subscription).where(
+                Subscription.expires_at.isnot(None),
+                Subscription.expires_at <= datetime.utcnow()
+            ).options(
+                selectinload(Subscription.user).selectinload(User.configs)
+            )
+            
+            result = await session.execute(stmt)
+            subscriptions = result.scalars().all()
+            
+            for sub in subscriptions:
+                user = sub.user
+                
+                active_sub_stmt = select(Subscription).where(
+                    Subscription.user_id == user.id,
+                    Subscription.id != sub.id,
+                    (Subscription.expires_at.is_(None) | (Subscription.expires_at > datetime.utcnow()))
+                )
+                active_result = await session.execute(active_sub_stmt)
+                has_active_sub = active_result.scalar() is not None
+                
+                if has_active_sub:
+                    continue
+                
+                for config in user.configs:
+                    if config.is_active:
+                        # Определяем на каком сервере конфиг
+                        if config.server_id:
+                            # Мультисервер - отключаем на удалённом сервере
+                            server = await WireGuardMultiService.get_server_by_id(session, config.server_id)
+                            if server:
+                                success, msg = await WireGuardMultiService.disable_config(config.public_key, server)
+                            else:
+                                success, msg = True, "Сервер удалён"
+                        else:
+                            # Локальный сервер
+                            success, msg = await WireGuardService.disable_config(config.public_key)
+                        
+                        if success:
+                            config.is_active = False
+                            logger.info(f"Конфиг {config.name} отключен (подписка истекла)")
+                        else:
+                            logger.error(f"Ошибка отключения конфига {config.name}: {msg}")
+                
+                await session.commit()
+                
+                # Удаляем истёкшую подписку чтобы не обрабатывать повторно
+                await session.delete(sub)
+                await session.commit()
+                logger.info(f"Истёкшая подписка #{sub.id} удалена для user_id={user.telegram_id}")
+                
+                try:
+                    await self.bot.send_message(
+                        user.telegram_id,
+                        "❌ Подписка истекла\n\n"
+                        "Ваши VPN конфиги были отключены.\n"
+                        "Продлите подписку для возобновления доступа.",
+                        parse_mode=None
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError) as e:
+                    error_msg = str(e)
+                    if "chat not found" in error_msg.lower() or "bot was blocked" in error_msg.lower() or "user is deactivated" in error_msg.lower():
+                        logger.warning(f"Пользователь недоступен user_id={user.telegram_id} (@{user.username}): {error_msg}")
+                        await self._handle_inactive_user(user)
+                    else:
+                        logger.error(f"Ошибка отправки уведомления об истечении user_id={user.telegram_id} (@{user.username}): {error_msg}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления об истечении user_id={user.telegram_id}: {e}")
+    
+    async def check_suspicious_activity(self):
+        """Проверяет подозрительную активность пользователей"""
+        logger.info("Проверка подозрительной активности...")
+        try:
+            alerts = await MonitoringService.check_suspicious_activity(self.bot)
+            if alerts:
+                logger.info(f"Обнаружено {len(alerts)} подозрительных активностей")
+            else:
+                logger.info("Подозрительная активность не обнаружена")
+        except Exception as e:
+            logger.error(f"Ошибка проверки подозрительной активности: {e}")
+    
+    async def update_traffic_stats(self):
+        """Обновляет накопительную статистику трафика для всех конфигов"""
+        logger.info("Обновление статистики трафика...")
+        
+        try:
+            from services.traffic import get_server_traffic
+            
+            async with async_session() as session:
+                # Получаем все активные серверы
+                servers_stmt = select(Server).where(Server.is_active == True)
+                servers_result = await session.execute(servers_stmt)
+                servers = servers_result.scalars().all()
+                
+                # Собираем трафик со всех серверов
+                all_traffic = {}
+                for server in servers:
+                    try:
+                        server_traffic = await get_server_traffic(server)
+                        if server_traffic:
+                            all_traffic.update(server_traffic)
+                    except Exception as e:
+                        logger.error(f"Ошибка получения трафика с сервера {server.name}: {e}")
+                
+                if not all_traffic:
+                    logger.info("Нет данных о трафике для обновления")
+                    return
+                
+                # Получаем все активные конфиги
+                configs_stmt = select(Config).where(Config.is_active == True)
+                configs_result = await session.execute(configs_stmt)
+                configs = configs_result.scalars().all()
+                
+                updated_count = 0
+                for config in configs:
+                    if config.public_key in all_traffic:
+                        stats = all_traffic[config.public_key]
+                        current_received = stats.get('received', 0)
+                        current_sent = stats.get('sent', 0)
+                        
+                        # Пропускаем если нет трафика
+                        if current_received == 0 and current_sent == 0:
+                            continue
+                        
+                        # Получаем сохранённые значения "до перезапуска WG"
+                        last_wg_received = config.last_wg_received or 0
+                        last_wg_sent = config.last_wg_sent or 0
+                        
+                        # Если текущий трафик меньше последнего известного — WG перезапустился
+                        # Сохраняем накопленный трафик и начинаем считать заново
+                        if current_received < last_wg_received or current_sent < last_wg_sent:
+                            # WG перезапустился — добавляем последний известный трафик к total
+                            # и начинаем отсчёт заново с текущих значений
+                            config.total_received = (config.total_received or 0) + last_wg_received
+                            config.total_sent = (config.total_sent or 0) + last_wg_sent
+                            config.last_wg_received = current_received
+                            config.last_wg_sent = current_sent
+                            logger.debug(f"WG restart detected for {config.name}: reset counters")
+                        else:
+                            # Обычное обновление — просто запоминаем текущие значения
+                            config.last_wg_received = current_received
+                            config.last_wg_sent = current_sent
+                        
+                        config.last_traffic_update = datetime.utcnow()
+                        updated_count += 1
+                
+                await session.commit()
+                logger.info(f"Обновлена статистика трафика для {updated_count} конфигов")
+                
+        except Exception as e:
+            logger.error(f"Ошибка обновления статистики трафика: {e}")
