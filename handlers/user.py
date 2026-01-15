@@ -2283,17 +2283,7 @@ async def request_extra_config(callback: CallbackQuery, state: FSMContext, bot: 
             await callback.answer("Ошибка: пользователь не найден", show_alert=True)
             return
         
-        has_active_sub = False
-        for sub in user.subscriptions:
-            if sub.expires_at is None or sub.expires_at > datetime.utcnow():
-                has_active_sub = True
-                break
-        
-        if not has_active_sub:
-            await callback.answer("❌ Нужна активная подписка для запроса конфига", show_alert=True)
-            return
-        
-        # Проверяем лимит конфигов
+        # Проверяем лимит конфигов (подписка НЕ требуется для создания конфига)
         current_configs = len(user.configs) if user.configs else 0
         
         # Сначала проверяем индивидуальный лимит пользователя
