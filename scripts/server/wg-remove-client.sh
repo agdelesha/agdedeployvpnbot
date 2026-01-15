@@ -14,14 +14,14 @@ if [ -z "$USERNAME" ]; then
 fi
 
 # Находим публичный ключ клиента
-PUBLIC_KEY=$(grep -A1 "# $USERNAME" $WG_CONFIG | grep PublicKey | awk '{print $3}')
+PUBLIC_KEY=$(grep -A2 "# BEGIN_PEER $USERNAME" $WG_CONFIG | grep PublicKey | awk '{print $3}')
 if [ -z "$PUBLIC_KEY" ]; then
     echo "Client not found"
     exit 1
 fi
 
-# Удаляем клиента из конфига
-sed -i "/# $USERNAME/,/^$/d" $WG_CONFIG
+# Удаляем клиента из конфига (включая BEGIN_PEER и END_PEER)
+sed -i "/# BEGIN_PEER $USERNAME/,/# END_PEER $USERNAME/d" $WG_CONFIG
 
 # Удаляем файлы клиента
 rm -f "$CLIENT_DIR/$USERNAME.conf" "$CLIENT_DIR/$USERNAME.png"
